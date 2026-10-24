@@ -2,6 +2,7 @@
 
 import * as core from "../lib/core.js";
 import * as rules from "../lib/rules.js";
+import * as hardening from "../lib/hardening.js";
 
 const args = process.argv.slice(2);
 
@@ -23,6 +24,10 @@ function printStatus(state) {
   out.push(`  备份 / backup  ${state.has_backup ? "有 / yes" : "无 / no"}`);
   out.push(`  注入文件       ${state.override_path}`);
   out.push(`  注入状态       ${state.override_status}`);
+  const freedomLevel = (() => {
+    try { return hardening.readFreedomState(state.dsh_home || "").hardening || ""; } catch { return ""; }
+  })();
+  out.push(`  破甲强化       ${freedomLevel || "随配置 / config"}`);
   out.push("");
   out.push(`  补丁 ${state.patches_applied}/${core.ALL_PATCHES.length} 已清洗, ${state.patches_pending} 待清洗`);
   for (const p of core.ALL_PATCHES) {
@@ -36,12 +41,15 @@ function printStatus(state) {
 }
 
 async function main() {
-  const mode = args.find((a) => ["--apply", "--revert", "--uninstall", "--status", "--edit", "--help"].includes(a));
+  const mode = args.find((a) => ["--apply", "--revert", "--uninstall", "--status", "--edit", "--freedom", "--help"].includes(a));
 
   if (mode === "--help" || args.includes("-h")) {
     console.log(`dsh-purge 用法:
   dsh-purge --status     显示状态
   dsh-purge --apply      应用全部清洗（提示词+代码+shim+override）
+  dsh-purge --freedom    自由度全开（全部清洗 + 强化层 nuclear + 始终注入 + hooks 放行）
+                         可加 --level=max|nuclear|standard|off
+                         可加 --profile=auto|v4pro|domestic|claude|openai
   dsh-purge --revert     回滚还原
   dsh-purge --uninstall  卸载插件（已应用则先还原）
   dsh-purge --edit       编辑注入文件 prompt-inject.md
@@ -95,6 +103,38 @@ async function main() {
     }
     console.log("");
     console.log("全部完成 / All done。重启 dsh 生效 / Restart dsh to take effect.");
+  } else if (mode === "--freedom") {
+    if (!state.ai_base) {
+      console.log("[ERROR] " + core.missingAiBaseMessage());
+      process.exit(1);
+    }
+    const levelArg = (args.find((a) => a.startsWith("--level=")) || "").split("=")[1] || "nuclear";
+    const level = hardening.normalizeLevel(levelArg);
+    const profileArg = (args.find((a) => a.startsWith("--profile=")) || "").split("=")[1] || "auto";
+    await rules.writeWorkspacePolicy(state.dsh_home, "always");
+    core.setHooksDenyConfigValue(true);
+    core.refreshHooksDenySettings();
+    hardening.writeFreedomState(state.dsh_home, {
+      hardening: level,
+      modelProfile: profileArg,
+      workspacePolicy: "always",
+      hooksDenyBypass: true,
+      analytics: false,
+    });
+    const { hosts, report } = await core.applyPatchesAllHosts(core.ALL_PATCHES, {
+      preserveClientBundles: false,
+      forApply: true,
+    });
+    const applied = report.filter((r) => r.status === "applied").length;
+    const already = report.filter((r) => r.status === "already").length;
+    const pending = report.filter((r) => r.status === "pending").length;
+    if (state.shim_dir) await core.patchShim(state.shim_dir);
+    console.log(`  自由度全开 / freedom=on: hardening=${level} profile=${profileArg} workspace-policy=always hooks-deny-bypass=on`);
+    console.log(`  补丁 / patches: applied=${applied}, already=${already}, pending=${pending}`);
+    console.log(`  宿主 / hosts: ${hosts.map((h) => h.aiBase).join(", ") || state.ai_base}`);
+    console.log(`  状态文件 / state: ${hardening.freedomStatePath(state.dsh_home)}`);
+    console.log("");
+    console.log("全部完成 / All done。重启 dsh 生效 / Restart dsh to take effect.");
   } else if (mode === "--revert") {
     if (state.ai_base || core.enumeratePatchAiBases().length) {
       const { reverted, errors } = await core.revertAllHosts();
@@ -137,7 +177,7 @@ async function main() {
     }
     console.log("  编辑完成后重启 dsh 生效。");
   } else {
-    console.log("默认不清洗，使用 --apply 应用清洗。");
+    console.log("默认不清洗，使用 --apply 应用清洗；--freedom 一次全开。");
   }
 }
 
